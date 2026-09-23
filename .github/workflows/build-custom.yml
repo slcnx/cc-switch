@@ -44,18 +44,28 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build frontend
-        run: pnpm build
+      # 关键：移除 tauri.conf.json 中强制要求的自动更新签名公钥和自动更新打包，避免因缺失官方私钥而构建失败
+      - name: Remove signing pubkey requirement
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = "src-tauri/tauri.conf.json";
+            const data = JSON.parse(fs.readFileSync(file, "utf8"));
+            if (data.plugins && data.plugins.updater) {
+              delete data.plugins.updater.pubkey;
+            }
+            if (data.bundle) {
+              data.bundle.createUpdaterArtifacts = false;
+            }
+            fs.writeFileSync(file, JSON.stringify(data, null, 2));
+            console.log("Successfully stripped updater signing requirement from tauri.conf.json");
+          '
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: ${{ matrix.args }}
-          tagName: false
-          releaseDraft: false
-          prerelease: false
+      - name: Build Tauri app (without updater signing)
+        shell: bash
+        run: |
+          pnpm tauri build ${{ matrix.args }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
