@@ -1,0 +1,103 @@
+name: Auto Sync and Merge Antigravity PR on Release
+
+on:
+  schedule:
+    # 每 3 小时自动轮询检查一次上游是否有新版本
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '指定构建/同步的 Release Tag（留空则默认检测最新版）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom branch
+        uses: actions/checkout@v4
+        with:
+          ref: release-with-antigravity
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Upstream Release Tag
+        id: upstream
+        run: |
+          if [ -n "${{ github.event.inputs.force_tag }}" ]; then
+            TARGET_TAG="${{ github.event.inputs.force_tag }}"
+            echo "Using manually specified tag: $TARGET_TAG"
+            echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          else
+            LATEST_TAG=$(curl -sL https://api.github.com/repos/farion1231/cc-switch/releases/latest | jq -r .tag_name)
+            echo "Upstream latest release tag: $LATEST_TAG"
+            echo "target_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+            PREV_TAG=""
+            if [ -f ".last_upstream_tag" ]; then
+              PREV_TAG=$(cat .last_upstream_tag)
+            fi
+            echo "Previous processed tag: $PREV_TAG"
+
+            if [ "$LATEST_TAG" = "$PREV_TAG" ]; then
+              echo "need_update=false" >> $GITHUB_OUTPUT
+              echo "No new release found. Exiting."
+            else
+              echo "need_update=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Fetch Upstream Tag & Merge PR #7413
+        if: steps.upstream.outputs.need_update == 'true'
+        env:
+          PR_NUMBER: "7413"
+        run: |
+          TARGET_TAG="${{ steps.upstream.outputs.target_tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 添加上游远程源
+          git remote add upstream https://github.com/farion1231/cc-switch.git || true
+          git fetch upstream tag "$TARGET_TAG" --no-tags
+
+          # 基于官方新 Tag 重置分支
+          git reset --hard "$TARGET_TAG"
+
+          # 拉取 PR 7413
+          git fetch upstream pull/${PR_NUMBER}/head:pr-to-merge
+
+          # 尝试合入 PR
+          echo "Merging PR #${PR_NUMBER} into ${TARGET_TAG}..."
+          if git merge pr-to-merge -m "chore: auto merge PR #${PR_NUMBER} based on upstream ${TARGET_TAG}"; then
+            echo "Merge succeeded cleanly!"
+          else
+            echo "Conflict detected, attempting resolution for known files..."
+            # 处理 misc.rs 中由于 WSL 探针引入的可能冲突
+            if git status --porcelain | grep -q "src-tauri/src/commands/misc.rs"; then
+              sed -i "s/version_probe_payload(tool)/version_probe_payload(bin)/g" src-tauri/src/commands/misc.rs || true
+              git add src-tauri/src/commands/misc.rs || true
+            fi
+            git commit -m "chore: auto merge PR #${PR_NUMBER} based on upstream ${TARGET_TAG} (with resolved conflict)" || {
+              echo "Failed to auto-resolve conflict. Manual inspection needed."
+              exit 1
+            }
+          fi
+
+          # 记录处理过的 Tag
+          echo "$TARGET_TAG" > .last_upstream_tag
+          git add .last_upstream_tag
+          git commit -m "chore: track upstream release tag ${TARGET_TAG}" || true
+
+          # 推送到 fork 仓库分支
+          git push origin release-with-antigravity --force
+
+          # 打上专属标签并推送
+          git tag -f "${TARGET_TAG}-antigravity"
+          git push origin "${TARGET_TAG}-antigravity" --force
+          echo "Successfully merged and pushed tag ${TARGET_TAG}-antigravity!"
